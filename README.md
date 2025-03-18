@@ -8,8 +8,8 @@ This repository is part of the `SAP + AWS GenAI Partnership | SAP GenAI Hub with
 
 1. Setup SAP GenAI Hub + Amazon Bedrock: 
 2. Getting started with Amazon Bedrock models like Nova, Claude and Titan
-    - Getting started with Amazon Nova models:
-    - Tool Calling with Bedrock Models via SAP GenAI Hub:
+    - Getting started with Amazon Nova models: [Link to 01-consume-bedrock-models-via-genaihub.ipynb](https://github.com/aws-samples/sample-sap-genai-hub-bedrock/blob/main/01-consume-bedrock-models-via-genaihub.ipynb)
+    - Tool Calling with Bedrock Models via SAP GenAI Hub: [Link to 02-tool-calling-via-amazon-nova-genaihub.ipynb](https://github.com/aws-samples/sample-sap-genai-hub-bedrock/blob/main/02-tool-calling-via-amazon-nova-genaihub.ipynb)
 
 ## Security
 
