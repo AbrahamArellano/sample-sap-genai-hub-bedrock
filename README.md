@@ -7,6 +7,7 @@ This repository is part of the `SAP + AWS GenAI Partnership | SAP GenAI Hub with
 #### Please go through the following labs in sequence:
 
 1. Setup Amazon Bedrock Models in SAP GenAI Hub: https://studio.us-east-1.prod.workshops.aws/workshops/6c1a3147-7c51-4b64-a3ad-5c302b7b41d8
+
 2. Consuming Amazon Bedrock models via GenAI Hub
 - Getting started with Amazon Bedrock models: [01-consume-bedrock-models-via-genaihub.ipynb](https://github.com/aws-samples/sample-sap-genai-hub-bedrock/blob/main/01-consume-bedrock-models-via-genaihub.ipynb)
 - Tool Calling with Amazon Nova Models via SAP GenAI Hub: [02-tool-calling-via-amazon-nova-genaihub.ipynb](https://github.com/aws-samples/sample-sap-genai-hub-bedrock/blob/main/)
