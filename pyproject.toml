@@ -1,0 +1,20 @@
+[project]
+name = "strands-sap"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aioboto3>=13.2.0",
+    "boto3>=1.35.27",
+    "duckduckgo-search>=8.0.4",
+    "generative-ai-hub-sdk>=4.12.4",
+    "ipykernel>=6.29.5",
+    "langchain==0.3.20",
+    "langgraph==0.3.20",
+    "strands-agents>=0.1.9",
+    "strands-agents-builder>=0.1.4",
+    "strands-agents-tools>=0.1.7",
+    "streamlit>=1.46.1",
+    "uvicorn>=0.34.3",
+]
