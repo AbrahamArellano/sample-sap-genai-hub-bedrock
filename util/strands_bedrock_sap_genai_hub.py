@@ -4,11 +4,13 @@
 - SDK Reference: https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/gen_ai_hub.html
 """
 
+import asyncio
 import json
 import logging
 import os
 from typing import (
     Any,
+    AsyncGenerator,
     Dict,
     Iterable,
     List,
@@ -17,7 +19,7 @@ from typing import (
     cast,
     TypeVar,
     Type,
-    Callable,
+    Union,
 )
 
 from pydantic import BaseModel
@@ -28,9 +30,10 @@ from strands.types.exceptions import (
     ContextWindowOverflowException,
     ModelThrottledException,
 )
-from strands.types.models import Model
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolSpec
+from strands.models.model import Model
+from strands.event_loop import streaming
 
 # Import SAP GenAI Hub SDK
 try:
@@ -51,6 +54,8 @@ CONTEXT_WINDOW_OVERFLOW_MESSAGES = [
     "input length and `max_tokens` exceed context limit",
     "too many total text bytes",
 ]
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class SAPGenAIHubModel(Model):
@@ -155,7 +160,6 @@ class SAPGenAIHubModel(Model):
         """
         return self.config["model_id"] == "amazon--titan-embed-text"
 
-    @override
     def format_request(
         self,
         messages: Messages,
@@ -375,7 +379,6 @@ class SAPGenAIHubModel(Model):
 
         return request
 
-    @override
     def format_chunk(self, event: Dict[str, Any]) -> StreamEvent:
         """Format the SAP GenAI Hub response events into standardized message chunks.
 
@@ -502,38 +505,97 @@ class SAPGenAIHubModel(Model):
             }
 
     @override
-    def stream(self, request: Dict[str, Any]) -> Iterable[StreamEvent]:
-        """Send the request to the SAP GenAI Hub model and get the response.
+    async def stream(
+        self,
+        messages: Messages,
+        tool_specs: Optional[List[ToolSpec]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream conversation with the SAP GenAI Hub model.
 
         This method calls the appropriate API based on the model type.
 
         Args:
-            request: The formatted request to send to the SAP GenAI Hub model
+            messages: List of message objects to be processed by the model.
+            tool_specs: List of tool specifications to make available to the model.
+            system_prompt: System prompt to provide context to the model.
+            **kwargs: Additional keyword arguments for future extensibility.
 
-        Returns:
+        Yields:
             An iterable of response events from the SAP GenAI Hub model
 
         Raises:
             ContextWindowOverflowException: If the input exceeds the model's context window.
             ModelThrottledException: If the model service is throttling requests.
         """
-        streaming = self.config.get("streaming", True)
+
+        def callback(event: Optional[StreamEvent] = None) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+            if event is None:
+                return
+
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[Optional[StreamEvent]] = asyncio.Queue()
+
+        thread = asyncio.to_thread(
+            self._stream, callback, messages, tool_specs, system_prompt
+        )
+        task = asyncio.create_task(thread)
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+
+            yield event
+
+        await task
+
+    def _stream(
+        self,
+        callback: Any,
+        messages: Messages,
+        tool_specs: Optional[List[ToolSpec]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        """Stream conversation with the SAP GenAI Hub model.
+
+        This method operates in a separate thread to avoid blocking the async event loop.
+
+        Args:
+            callback: Function to send events to the main thread.
+            messages: List of message objects to be processed by the model.
+            tool_specs: List of tool specifications to make available to the model.
+            system_prompt: System prompt to provide context to the model.
+
+        Raises:
+            ContextWindowOverflowException: If the input exceeds the model's context window.
+            ModelThrottledException: If the model service is throttling requests.
+        """
+        streaming_enabled = self.config.get("streaming", True)
 
         try:
+            # Format the request
+            request = self.format_request(messages, tool_specs, system_prompt)
+
             if self._is_nova_model() or self._is_claude_model():
-                if streaming:
+                if streaming_enabled:
                     # TODO: Implement streaming for Nova/Claude models when SAP GenAI Hub supports it
                     # For now, use non-streaming and convert to streaming format
                     response = self.client.converse(**request)
-                    yield from self._convert_non_streaming_to_streaming(response)
+                    for event in self._convert_non_streaming_to_streaming(response):
+                        callback(event)
                 else:
                     response = self.client.converse(**request)
-                    yield from self._convert_non_streaming_to_streaming(response)
+                    for event in self._convert_non_streaming_to_streaming(response):
+                        callback(event)
 
             elif self._is_titan_text_model() or self._is_titan_embed_model():
                 # Titan models don't support streaming
                 response = self.client.invoke_model(**request)
-                yield from self._convert_non_streaming_to_streaming(response)
+                for event in self._convert_non_streaming_to_streaming(response):
+                    callback(event)
 
         except Exception as e:
             error_message = str(e)
@@ -552,72 +614,75 @@ class SAPGenAIHubModel(Model):
 
             # Otherwise raise the error
             raise e
+        finally:
+            callback()
 
-    def structured_output(self, schema_type: Type, **kwargs: Any) -> Any:
-        """Generate a structured output based on the provided schema.
+    @override
+    async def structured_output(
+        self,
+        output_model: Type[T],
+        prompt: Messages,
+        system_prompt: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Dict[str, Union[T, Any]], None]:
+        """Get structured output from the model.
 
         Args:
-            schema_type: The Pydantic model class that defines the output schema.
-            **kwargs: Additional arguments to pass to the model.
+            output_model: The output model to use for the agent.
+            prompt: The prompt messages to use for the agent.
+            system_prompt: System prompt to provide context to the model.
+            **kwargs: Additional keyword arguments for future extensibility.
 
-        Returns:
-            An instance of the provided schema_type.
+        Yields:
+            Model events with the last being the structured output.
         """
-        from strands.event_loop.streaming import process_stream
-        from strands.handlers.callback_handler import PrintingCallbackHandler
         from strands.tools import convert_pydantic_to_tool_spec
 
-        # Create a tool spec from the schema
-        tool_spec = convert_pydantic_to_tool_spec(schema_type)
+        tool_spec = convert_pydantic_to_tool_spec(output_model)
 
         # Create a system prompt that instructs the model to generate a structured output
-        system_prompt = f"""You are a helpful assistant that generates structured data according to a specific schema.
+        enhanced_system_prompt = f"""You are a helpful assistant that generates structured data according to a specific schema.
         
         The user will provide you with a request, and you must respond with a valid instance of the following schema:
         
-        {schema_type.schema_json(indent=2)}
+        {output_model.schema_json(indent=2)}
         
         Your response should be a valid JSON object that conforms to this schema.
         """
 
-        # Create a message with the user's request
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "text": f"Generate a structured output according to the provided schema based on this request: {kwargs.get('prompt', '')}"
-                    }
-                ],
-            }
-        ]
+        if system_prompt:
+            enhanced_system_prompt = f"{system_prompt}\n\n{enhanced_system_prompt}"
 
-        # Format the request
-        request = self.format_request(
-            messages=messages,
+        response = self.stream(
+            messages=prompt,
             tool_specs=[tool_spec],
-            system_prompt=system_prompt,
+            system_prompt=enhanced_system_prompt,
+            **kwargs,
         )
 
-        # Stream the response
-        chunks = self.stream(request)
+        async for event in streaming.process_stream(response):
+            yield event
 
-        # Process the stream to extract the structured output
-        result = None
-        for event in process_stream(chunks, messages):
-            if "callback" in event and "delta" in event["callback"]:
-                delta = event["callback"]["delta"]
-                if "toolUse" in delta and "input" in delta["toolUse"]:
-                    # Parse the tool use input as JSON
-                    try:
-                        input_json = json.loads(delta["toolUse"]["input"])
-                        # Create an instance of the schema type from the JSON
-                        result = schema_type(**input_json)
-                    except Exception as e:
-                        logger.error(f"Error parsing structured output: {e}")
-                        raise ValueError(f"Failed to parse structured output: {e}")
+        stop_reason, messages, _, _ = event["stop"]
 
-        if result is None:
-            raise ValueError("Failed to generate structured output")
+        if stop_reason != "tool_use":
+            raise ValueError(
+                "No valid tool use or tool use input was found in the response."
+            )
 
-        return result
+        content = messages["content"]
+        output_response: Dict[str, Any] | None = None
+        for block in content:
+            # if the tool use name doesn't match the tool spec name, skip, and if the block is not a tool use, skip.
+            # if the tool use name never matches, raise an error.
+            if block.get("toolUse") and block["toolUse"]["name"] == tool_spec["name"]:
+                output_response = block["toolUse"]["input"]
+            else:
+                continue
+
+        if output_response is None:
+            raise ValueError(
+                "No valid tool use or tool use input was found in the response."
+            )
+
+        yield {"output": output_model(**output_response)}
