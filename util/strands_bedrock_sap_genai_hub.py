@@ -4,13 +4,11 @@
 - SDK Reference: https://help.sap.com/doc/generative-ai-hub-sdk/CLOUD/en-US/_reference/gen_ai_hub.html
 """
 
-import asyncio
 import json
 import logging
 import os
 from typing import (
     Any,
-    AsyncGenerator,
     Dict,
     Iterable,
     List,
@@ -19,7 +17,7 @@ from typing import (
     cast,
     TypeVar,
     Type,
-    Union,
+    Callable,
 )
 
 from pydantic import BaseModel
@@ -30,10 +28,9 @@ from strands.types.exceptions import (
     ContextWindowOverflowException,
     ModelThrottledException,
 )
+from strands.models import Model
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolSpec
-from strands.models.model import Model
-from strands.event_loop import streaming
 
 # Import SAP GenAI Hub SDK
 try:
@@ -54,8 +51,6 @@ CONTEXT_WINDOW_OVERFLOW_MESSAGES = [
     "input length and `max_tokens` exceed context limit",
     "too many total text bytes",
 ]
-
-T = TypeVar("T", bound=BaseModel)
 
 
 class SAPGenAIHubModel(Model):
@@ -103,7 +98,7 @@ class SAPGenAIHubModel(Model):
         )
         self.update_config(**model_config)
 
-        logger.debug("config=<%s> | initializing", self.config)
+        # logger.debug("config=<%s> | initializing", self.config)
 
         # Initialize the SAP GenAI Hub client not BOTO3
         self.client = Session().client(model_name=self.config["model_id"])
@@ -143,15 +138,6 @@ class SAPGenAIHubModel(Model):
         """
         return self.config["model_id"].startswith("anthropic--claude")
 
-    def _is_titan_text_model(self) -> bool:
-        """Check if the current model is an Amazon Titan Text model.
-
-        Returns:
-            True if the model is an Amazon Titan Text model, False otherwise.
-        """
-        titan_text_models = ["amazon--titan-text-lite", "amazon--titan-text-express"]
-        return self.config["model_id"] in titan_text_models
-
     def _is_titan_embed_model(self) -> bool:
         """Check if the current model is an Amazon Titan Embedding model.
 
@@ -160,6 +146,7 @@ class SAPGenAIHubModel(Model):
         """
         return self.config["model_id"] == "amazon--titan-embed-text"
 
+    @override
     def format_request(
         self,
         messages: Messages,
@@ -182,8 +169,6 @@ class SAPGenAIHubModel(Model):
             return self._format_nova_request(messages, tool_specs, system_prompt)
         elif self._is_claude_model():
             return self._format_claude_request(messages, tool_specs, system_prompt)
-        elif self._is_titan_text_model():
-            return self._format_titan_text_request(messages)
         elif self._is_titan_embed_model():
             return self._format_titan_embed_request(messages)
         else:
@@ -291,59 +276,6 @@ class SAPGenAIHubModel(Model):
 
         return request
 
-    def _format_titan_text_request(self, messages: Messages) -> Dict[str, Any]:
-        """Format a request for Amazon Titan Text models.
-
-        Args:
-            messages: List of message objects to be processed by the model.
-
-        Returns:
-            A formatted request for Amazon Titan Text models.
-        """
-        # Extract the text from the last user message
-        input_text = ""
-        for message in reversed(messages):
-            if message["role"] == "user" and "content" in message:
-                content_blocks = message["content"]
-                if isinstance(content_blocks, list):
-                    for block in content_blocks:
-                        if "text" in block:
-                            input_text = block["text"]
-                            break
-                if input_text:
-                    break
-
-        # Create the request body
-        request_body = {
-            "inputText": input_text,
-            "textGenerationConfig": {
-                key: value
-                for key, value in [
-                    ("maxTokenCount", self.config.get("max_tokens")),
-                    ("temperature", self.config.get("temperature")),
-                    ("topP", self.config.get("top_p")),
-                    ("stopSequences", self.config.get("stop_sequences")),
-                ]
-                if value is not None
-            },
-        }
-
-        # Format the request according to the invoke_model API requirements
-        request = {
-            "body": json.dumps(request_body),
-            "contentType": "application/json",
-            "accept": "application/json",
-        }
-
-        # Add additional arguments if provided
-        if (
-            "additional_args" in self.config
-            and self.config["additional_args"] is not None
-        ):
-            request.update(self.config["additional_args"])
-
-        return request
-
     def _format_titan_embed_request(self, messages: Messages) -> Dict[str, Any]:
         """Format a request for Amazon Titan Embedding models.
 
@@ -379,6 +311,7 @@ class SAPGenAIHubModel(Model):
 
         return request
 
+    @override
     def format_chunk(self, event: Dict[str, Any]) -> StreamEvent:
         """Format the SAP GenAI Hub response events into standardized message chunks.
 
@@ -388,9 +321,154 @@ class SAPGenAIHubModel(Model):
         Returns:
             The formatted chunk.
         """
-        return cast(StreamEvent, event)
+        # Handle string events by wrapping them in a proper structure
+        if isinstance(event, str):
+            return {
+                "contentBlockDelta": {
+                    "delta": {"text": event}
+                }
+            }
+        
+        # If it's already a proper dictionary, return it as is
+        if isinstance(event, dict):
+            return cast(StreamEvent, event)
+        
+        # For any other type, convert to string and wrap
+        return {
+            "contentBlockDelta": {
+                "delta": {"text": str(event)}
+            }
+        }
 
-    def _convert_non_streaming_to_streaming(
+    def _convert_streaming_response(
+        self, stream_response: Any
+    ) -> Iterable[StreamEvent]:
+        """Convert a streaming response to the standardized streaming format.
+
+        Args:
+            stream_response: The streaming response from the SAP GenAI Hub model.
+
+        Returns:
+            An iterable of response events in the streaming format.
+        """
+        try:
+            # logger.debug(f"Converting streaming response of type: {type(stream_response)}")
+            
+            # SAP GenAI Hub streaming responses might be different formats
+            # Let's handle the most common patterns
+            
+            message_started = False
+            event_count = 0
+            content_received = False
+            
+            # Check if it's a Bedrock-style response with 'stream' key
+            if hasattr(stream_response, 'get') and callable(getattr(stream_response, 'get')):
+                event_stream = stream_response.get('stream')
+                if event_stream:
+                    # logger.debug("Processing Bedrock-style event stream")
+                    
+                    for event in event_stream:
+                        event_count += 1
+                        # logger.debug(f"Processing stream event {event_count}: {event}")
+                        
+                        # Start message if not started
+                        if not message_started:
+                            yield {"messageStart": {"role": "assistant"}}
+                            message_started = True
+                        
+                        # Process the event based on its structure
+                        if isinstance(event, dict):
+                            # Pass through properly formatted events
+                            if any(key in event for key in ['contentBlockDelta', 'contentBlockStart', 'contentBlockStop', 'messageStart', 'messageStop', 'metadata']):
+                                if 'contentBlockDelta' in event:
+                                    content_received = True
+                                yield event
+                            else:
+                                # Format unknown events
+                                formatted_event = self.format_chunk(event)
+                                if 'contentBlockDelta' in formatted_event:
+                                    content_received = True
+                                yield formatted_event
+                        else:
+                            # Handle non-dict events (strings, etc.)
+                            formatted_event = self.format_chunk(event)
+                            if 'contentBlockDelta' in formatted_event:
+                                content_received = True
+                            yield formatted_event
+                    
+                    # Don't add extra messageStop - it should come from the stream itself
+                    # logger.debug(f"Processed {event_count} events from Bedrock stream, content_received: {content_received}")
+                    return
+            
+            # Try to iterate directly over the stream_response
+            try:
+                # logger.debug("Attempting direct iteration over stream_response")
+                # logger.debug(f"Stream response attributes: {dir(stream_response)}")
+                
+                # Check if this is a generator or iterator
+                if hasattr(stream_response, '__iter__'):
+                    logger.debug("Stream response is iterable")
+                    
+                    for event in stream_response:
+                        event_count += 1
+                        logger.debug(f"Processing direct stream event {event_count}: {type(event)} - {event}")
+                        
+                        # Start message if not started
+                        if not message_started:
+                            yield {"messageStart": {"role": "assistant"}}
+                            message_started = True
+                        
+                        # Process the event
+                        if isinstance(event, dict):
+                            # Check if it's already a properly formatted streaming event
+                            if any(key in event for key in ['contentBlockDelta', 'contentBlockStart', 'contentBlockStop', 'messageStart', 'messageStop', 'metadata']):
+                                if 'contentBlockDelta' in event:
+                                    content_received = True
+                                
+                                # Always yield the event as-is, including messageStop
+                                yield event
+                                
+                                # If this is a messageStop event, we're done with this stream
+                                if 'messageStop' in event:
+                                    logger.debug(f"Received messageStop event from stream: {event}")
+                                    return
+                            else:
+                                # Format unknown events
+                                formatted_event = self.format_chunk(event)
+                                if 'contentBlockDelta' in formatted_event:
+                                    content_received = True
+                                yield formatted_event
+                        else:
+                            # Handle strings and other types
+                            formatted_event = self.format_chunk(event)
+                            if 'contentBlockDelta' in formatted_event:
+                                content_received = True
+                            yield formatted_event
+                    
+                    # Don't add extra messageStop - it should come from the stream itself
+                    logger.debug(f"Processed {event_count} events from direct iteration, content_received: {content_received}")
+                else:
+                    logger.debug("Stream response is not iterable, treating as single response")
+                    yield {"messageStart": {"role": "assistant"}}
+                    formatted_event = self.format_chunk(stream_response)
+                    yield formatted_event
+                    # Don't add messageStop for non-streaming responses
+                
+            except TypeError as te:
+                # stream_response is not iterable
+                logger.debug(f"Stream response not iterable ({te}), treating as single response")
+                yield {"messageStart": {"role": "assistant"}}
+                formatted_event = self.format_chunk(stream_response)
+                yield formatted_event
+                # Don't add messageStop for non-iterable responses
+                
+        except Exception as e:
+            logger.error(f"Error processing streaming response: {e}")
+            logger.error(f"Stream response type: {type(stream_response)}")
+            logger.error(f"Stream response attributes: {dir(stream_response) if hasattr(stream_response, '__dict__') else 'No attributes'}")
+            raise e
+
+    async def _convert_non_streaming_to_streaming(
         self, response: Dict[str, Any]
     ) -> Iterable[StreamEvent]:
         """Convert a non-streaming response to the streaming format.
@@ -456,29 +534,6 @@ class SAPGenAIHubModel(Model):
                     metadata["metadata"]["metrics"] = response["metrics"]
                 yield metadata
 
-        elif self._is_titan_text_model():
-            # Titan Text models have a different response format
-            # Yield messageStart event
-            yield {"messageStart": {"role": "assistant"}}
-
-            # Yield content block for text
-            if "results" in response and len(response["results"]) > 0:
-                yield {
-                    "contentBlockDelta": {
-                        "delta": {"text": response["results"][0]["outputText"]},
-                    }
-                }
-
-            # Yield contentBlockStop event
-            yield {"contentBlockStop": {}}
-
-            # Yield messageStop event
-            yield {
-                "messageStop": {
-                    "stopReason": "stop",
-                }
-            }
-
         elif self._is_titan_embed_model():
             # Titan Embedding models have a different response format
             # Yield messageStart event
@@ -511,91 +566,111 @@ class SAPGenAIHubModel(Model):
         tool_specs: Optional[List[ToolSpec]] = None,
         system_prompt: Optional[str] = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[StreamEvent, None]:
-        """Stream conversation with the SAP GenAI Hub model.
-
-        This method calls the appropriate API based on the model type.
+    ) -> Iterable[StreamEvent]:
+        """Send the request to the SAP GenAI Hub model and get the response.
 
         Args:
             messages: List of message objects to be processed by the model.
             tool_specs: List of tool specifications to make available to the model.
             system_prompt: System prompt to provide context to the model.
-            **kwargs: Additional keyword arguments for future extensibility.
+            **kwargs: Additional keyword arguments.
 
-        Yields:
+        Returns:
             An iterable of response events from the SAP GenAI Hub model
 
         Raises:
             ContextWindowOverflowException: If the input exceeds the model's context window.
             ModelThrottledException: If the model service is throttling requests.
         """
-
-        def callback(event: Optional[StreamEvent] = None) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, event)
-            if event is None:
-                return
-
-        loop = asyncio.get_event_loop()
-        queue: asyncio.Queue[Optional[StreamEvent]] = asyncio.Queue()
-
-        thread = asyncio.to_thread(
-            self._stream, callback, messages, tool_specs, system_prompt
-        )
-        task = asyncio.create_task(thread)
-
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-
-            yield event
-
-        await task
-
-    def _stream(
-        self,
-        callback: Any,
-        messages: Messages,
-        tool_specs: Optional[List[ToolSpec]] = None,
-        system_prompt: Optional[str] = None,
-    ) -> None:
-        """Stream conversation with the SAP GenAI Hub model.
-
-        This method operates in a separate thread to avoid blocking the async event loop.
-
-        Args:
-            callback: Function to send events to the main thread.
-            messages: List of message objects to be processed by the model.
-            tool_specs: List of tool specifications to make available to the model.
-            system_prompt: System prompt to provide context to the model.
-
-        Raises:
-            ContextWindowOverflowException: If the input exceeds the model's context window.
-            ModelThrottledException: If the model service is throttling requests.
-        """
-        streaming_enabled = self.config.get("streaming", True)
+        request = self.format_request(messages, tool_specs, system_prompt)
+        streaming = self.config.get("streaming", True)
 
         try:
-            # Format the request
-            request = self.format_request(messages, tool_specs, system_prompt)
-
             if self._is_nova_model() or self._is_claude_model():
-                if streaming_enabled:
-                    # TODO: Implement streaming for Nova/Claude models when SAP GenAI Hub supports it
-                    # For now, use non-streaming and convert to streaming format
-                    response = self.client.converse(**request)
-                    for event in self._convert_non_streaming_to_streaming(response):
-                        callback(event)
+                if streaming:
+                    # Use converse_stream for streaming responses
+                    try:
+                        logger.debug("Attempting to use converse_stream")
+                        stream_response = self.client.converse_stream(**request)
+                        logger.debug(f"Stream response received: {type(stream_response)}")
+                        logger.debug(f"Stream response dir: {dir(stream_response)}")
+                        
+                        # Let's try to understand the structure better
+                        if hasattr(stream_response, '__dict__'):
+                            logger.debug(f"Stream response dict: {stream_response.__dict__}")
+                        
+                        # Process all streaming events
+                        event_count = 0
+                        has_content = False
+                        
+                        try:
+                            for event in self._convert_streaming_response(stream_response):
+                                event_count += 1
+                                logger.debug(f"Yielding event {event_count}: {event}")
+                                
+                                # Check if we have actual content
+                                if 'contentBlockDelta' in event and 'delta' in event['contentBlockDelta']:
+                                    if 'text' in event['contentBlockDelta']['delta'] or 'toolUse' in event['contentBlockDelta']['delta']:
+                                        has_content = True
+                                
+                                yield event
+                        except Exception as stream_error:
+                            logger.error(f"Error during streaming: {stream_error}")
+                            logger.error(f"Stream error type: {type(stream_error)}")
+                            raise stream_error
+                        
+                        logger.debug(f"Processed {event_count} streaming events, has_content: {has_content}")
+                        
+                        # If we didn't get any content, fallback to non-streaming
+                        if event_count == 0 or not has_content:
+                            logger.warning("No content received from streaming response, falling back to non-streaming")
+                            response = self.client.converse(**request)
+                            async for event in self._convert_non_streaming_to_streaming(response):
+                                yield event
+                                
+                    except (AttributeError, Exception) as e:
+                        # Fallback to non-streaming if converse_stream is not available or fails
+                        logger.warning(f"converse_stream failed ({e}), falling back to non-streaming")
+                        response = self.client.converse(**request)
+                        async for event in self._convert_non_streaming_to_streaming(response):
+                            yield event
                 else:
+                    # Non-streaming path
+                    logger.debug("Using non-streaming converse API")
                     response = self.client.converse(**request)
-                    for event in self._convert_non_streaming_to_streaming(response):
-                        callback(event)
+                    async for event in self._convert_non_streaming_to_streaming(response):
+                        yield event
 
-            elif self._is_titan_text_model() or self._is_titan_embed_model():
-                # Titan models don't support streaming
-                response = self.client.invoke_model(**request)
-                for event in self._convert_non_streaming_to_streaming(response):
-                    callback(event)
+            elif self._is_titan_embed_model():
+                if streaming:
+                    # Try streaming for Titan models
+                    try:
+                        logger.debug("Attempting to use invoke_model_with_response_stream for Titan")
+                        stream_response = self.client.invoke_model_with_response_stream(**request)
+                        
+                        event_count = 0
+                        for event in self._convert_streaming_response(stream_response):
+                            event_count += 1
+                            logger.debug(f"Yielding Titan event {event_count}: {event}")
+                            yield event
+                        
+                        if event_count == 0:
+                            logger.warning("No events from Titan streaming, falling back to non-streaming")
+                            response = self.client.invoke_model(**request)
+                            async for event in self._convert_non_streaming_to_streaming(response):
+                                yield event
+                                
+                    except (AttributeError, Exception) as e:
+                        logger.warning(f"Titan streaming failed ({e}), falling back to non-streaming")
+                        response = self.client.invoke_model(**request)
+                        async for event in self._convert_non_streaming_to_streaming(response):
+                            yield event
+                else:
+                    # Non-streaming path for Titan
+                    logger.debug("Using non-streaming invoke_model API for Titan")
+                    response = self.client.invoke_model(**request)
+                    async for event in self._convert_non_streaming_to_streaming(response):
+                        yield event
 
         except Exception as e:
             error_message = str(e)
@@ -614,75 +689,72 @@ class SAPGenAIHubModel(Model):
 
             # Otherwise raise the error
             raise e
-        finally:
-            callback()
 
-    @override
-    async def structured_output(
-        self,
-        output_model: Type[T],
-        prompt: Messages,
-        system_prompt: Optional[str] = None,
-        **kwargs: Any,
-    ) -> AsyncGenerator[Dict[str, Union[T, Any]], None]:
-        """Get structured output from the model.
+    def structured_output(self, schema_type: Type, **kwargs: Any) -> Any:
+        """Generate a structured output based on the provided schema.
 
         Args:
-            output_model: The output model to use for the agent.
-            prompt: The prompt messages to use for the agent.
-            system_prompt: System prompt to provide context to the model.
-            **kwargs: Additional keyword arguments for future extensibility.
+            schema_type: The Pydantic model class that defines the output schema.
+            **kwargs: Additional arguments to pass to the model.
 
-        Yields:
-            Model events with the last being the structured output.
+        Returns:
+            An instance of the provided schema_type.
         """
+        from strands.event_loop.streaming import process_stream
+        from strands.handlers.callback_handler import PrintingCallbackHandler
         from strands.tools import convert_pydantic_to_tool_spec
 
-        tool_spec = convert_pydantic_to_tool_spec(output_model)
+        # Create a tool spec from the schema
+        tool_spec = convert_pydantic_to_tool_spec(schema_type)
 
         # Create a system prompt that instructs the model to generate a structured output
-        enhanced_system_prompt = f"""You are a helpful assistant that generates structured data according to a specific schema.
+        system_prompt = f"""You are a helpful assistant that generates structured data according to a specific schema.
         
         The user will provide you with a request, and you must respond with a valid instance of the following schema:
         
-        {output_model.schema_json(indent=2)}
+        {schema_type.schema_json(indent=2)}
         
         Your response should be a valid JSON object that conforms to this schema.
         """
 
-        if system_prompt:
-            enhanced_system_prompt = f"{system_prompt}\n\n{enhanced_system_prompt}"
+        # Create a message with the user's request
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "text": f"Generate a structured output according to the provided schema based on this request: {kwargs.get('prompt', '')}"
+                    }
+                ],
+            }
+        ]
 
-        response = self.stream(
-            messages=prompt,
+        # Format the request
+        request = self.format_request(
+            messages=messages,
             tool_specs=[tool_spec],
-            system_prompt=enhanced_system_prompt,
-            **kwargs,
+            system_prompt=system_prompt,
         )
 
-        async for event in streaming.process_stream(response):
-            yield event
+        # Stream the response
+        chunks = self.stream(request)
 
-        stop_reason, messages, _, _ = event["stop"]
+        # Process the stream to extract the structured output
+        result = None
+        for event in process_stream(chunks, messages):
+            if "callback" in event and "delta" in event["callback"]:
+                delta = event["callback"]["delta"]
+                if "toolUse" in delta and "input" in delta["toolUse"]:
+                    # Parse the tool use input as JSON
+                    try:
+                        input_json = json.loads(delta["toolUse"]["input"])
+                        # Create an instance of the schema type from the JSON
+                        result = schema_type(**input_json)
+                    except Exception as e:
+                        logger.error(f"Error parsing structured output: {e}")
+                        raise ValueError(f"Failed to parse structured output: {e}")
 
-        if stop_reason != "tool_use":
-            raise ValueError(
-                "No valid tool use or tool use input was found in the response."
-            )
+        if result is None:
+            raise ValueError("Failed to generate structured output")
 
-        content = messages["content"]
-        output_response: Dict[str, Any] | None = None
-        for block in content:
-            # if the tool use name doesn't match the tool spec name, skip, and if the block is not a tool use, skip.
-            # if the tool use name never matches, raise an error.
-            if block.get("toolUse") and block["toolUse"]["name"] == tool_spec["name"]:
-                output_response = block["toolUse"]["input"]
-            else:
-                continue
-
-        if output_response is None:
-            raise ValueError(
-                "No valid tool use or tool use input was found in the response."
-            )
-
-        yield {"output": output_model(**output_response)}
+        return result
